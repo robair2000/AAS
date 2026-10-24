@@ -47,8 +47,10 @@ export const TOKENS = {
   MAGIC: '0x539bdE0d7Dbd336b79148AA742883198BBF60342',
 };
 
-// Quote tokens must be a stablecoin or WETH so profit can be valued in USD.
 export const STABLES = new Set(['USDC', 'USDC.e', 'USDT']);
+// Tokens a new token can be paired against. Anything not WETH/stable gets
+// converted through Uniswap's deep pools when the two DEXs use different quotes.
+export const QUOTE_TOKENS = ['WETH', 'USDC', 'USDC.e', 'USDT', 'WBTC', 'ARB'];
 
 export const UNI_FEE_TIERS = [100, 500, 3000, 10000];
 

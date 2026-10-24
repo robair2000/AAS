@@ -7,17 +7,15 @@
 //   - DexScreener:  all pairs for each candidate (to confirm Camelot + Uniswap listings)
 //   - GoPlus:       honeypot / tax / owner-power checks
 import { AbiCoder, keccak256, getAddress, ZeroAddress } from 'ethers';
-import { TOKENS, STABLES, EXCLUDE_TOKENS } from './config.js';
+import { TOKENS, QUOTE_TOKENS, EXCLUDE_TOKENS } from './config.js';
 
 const coder = AbiCoder.defaultAbiCoder();
 const GT = 'https://api.geckoterminal.com/api/v2';
 const DS = 'https://api.dexscreener.com';
 const GOPLUS = 'https://api.gopluslabs.io/api/v1/token_security/42161';
 
-// Quote tokens we can value in USD: symbol -> address (lowercase)
-const QUOTES = Object.fromEntries(
-  ['WETH', ...STABLES].map((s) => [TOKENS[s].toLowerCase(), s])
-);
+// Quote tokens: lowercase address -> symbol
+const QUOTES = Object.fromEntries(QUOTE_TOKENS.map((s) => [TOKENS[s].toLowerCase(), s]));
 const EXCLUDED = new Set(
   [...Object.values(TOKENS), ...EXCLUDE_TOKENS].map((a) => a.toLowerCase())
 );
@@ -33,16 +31,18 @@ async function getJson(url, { timeoutMs = 15000, tries = 3 } = {}) {
     try {
       const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(timeoutMs) });
       if (res.status === 429) {
-        await sleep(5000 * (i + 1));
+        if (i === tries - 1) throw new Error('rate limited (HTTP 429)');
+        await sleep(8000 * (i + 1));
         continue;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
-      if (i === tries - 1) throw new Error(`${url.split('?')[0]}: ${e.message}`);
+      if (i === tries - 1) throw new Error(`${url.split('?')[0].replace(/^https:\/\//, '')}: ${e.message}`);
       await sleep(2000 * (i + 1));
     }
   }
+  throw new Error(`${url.split('?')[0]}: no response`);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isAddr = (a) => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a);
@@ -53,18 +53,21 @@ async function camelotDexIds(log) {
   if (camelotIdsCache) return camelotIdsCache;
   const ids = [];
   try {
-    for (const page of [1, 2]) {
-      const j = await getJson(`${GT}/networks/arbitrum/dexes?page=${page}`);
-      for (const d of j.data ?? []) if (String(d.id).toLowerCase().includes('camelot')) ids.push(d.id);
-      await sleep(GT_SPACING_MS);
-      if (!(j.data ?? []).length) break;
-    }
+    // only page 1: GeckoTerminal answers HTTP 400 for later pages of this list
+    const j = await getJson(`${GT}/networks/arbitrum/dexes`);
+    for (const d of j.data ?? []) if (String(d.id).toLowerCase().includes('camelot')) ids.push(d.id);
+    await sleep(GT_SPACING_MS);
   } catch (e) {
     log({ msg: 'could not list GeckoTerminal dexes', err: e.message });
   }
-  if (ids.length) camelotIdsCache = ids.slice(0, 3);
-  log({ msg: 'camelot dex ids on GeckoTerminal', ids });
-  return ids.slice(0, 3);
+  if (!ids.length) {
+    // fallback: the ids GeckoTerminal used when this was written
+    log({ msg: 'using default camelot dex ids', ids: ['camelot', 'camelot-v3'] });
+    return ['camelot', 'camelot-v3'];
+  }
+  camelotIdsCache = ids.slice(0, 3);
+  log({ msg: 'camelot dex ids on GeckoTerminal', ids: camelotIdsCache });
+  return camelotIdsCache;
 }
 
 // ---------- 1. candidate tokens from trending feeds ----------
@@ -197,19 +200,29 @@ function analyse(token, pairs, opts) {
     entry[dex].push({ liq, url: p.url, labels });
   }
 
-  // Pick the quote token with the most liquidity present on BOTH DEXs
+  // Pick the Camelot quote and Uniswap quote with the most liquidity on the thinner side.
+  // Same quote on both sides is preferred; different quotes need a conversion swap.
+  const camLiq = {}, uniLiq = {}, urls = {};
+  for (const [q, e] of Object.entries(byQuote)) {
+    if (e.camelot.length) camLiq[q] = Math.max(...e.camelot.map((x) => x.liq));
+    if (e.uniswap.length) uniLiq[q] = Math.max(...e.uniswap.map((x) => x.liq));
+    urls[q] = (e.uniswap[0] ?? e.camelot[0])?.url;
+  }
   let best = null;
-  for (const [quoteSym, e] of Object.entries(byQuote)) {
-    const cam = Math.max(0, ...e.camelot.map((x) => x.liq));
-    const uni = Math.max(0, ...e.uniswap.map((x) => x.liq));
-    const minSide = Math.min(cam, uni);
-    if (minSide > (best?.minSide ?? 0)) best = { quoteSym, cam, uni, minSide, v4Keys: e.v4Keys, url: (e.uniswap[0] ?? e.camelot[0])?.url };
+  for (const [cq, cl] of Object.entries(camLiq)) {
+    for (const [uq, ul] of Object.entries(uniLiq)) {
+      if (cq !== uq && !opts.crossQuote) continue;
+      const minSide = Math.min(cl, ul);
+      const score = minSide * (cq === uq ? 1.25 : 1);
+      if (score > (best?.score ?? 0))
+        best = { camQuote: cq, uniQuote: uq, cam: cl, uni: ul, minSide, score, v4Keys: byQuote[uq].v4Keys, url: urls[uq] ?? urls[cq] };
+    }
   }
   if (!best) {
     const top = seen.sort((a, b) => b.liq - a.liq).slice(0, 3).map((x) => `${x.where} $${Math.round(x.liq)}`);
     const onCam = seen.some((x) => x.where.startsWith('camelot'));
     const onUni = seen.some((x) => x.where.startsWith('uniswap'));
-    const category = !seen.length ? 'no pools found' : onCam && onUni ? 'both DEXs but different/unsupported pairs' : onCam ? 'camelot only' : onUni ? 'uniswap only' : 'other DEXs only';
+    const category = !seen.length ? 'no pools found' : onCam && onUni ? 'both DEXs but unsupported quote tokens' : onCam ? 'camelot only' : onUni ? 'uniswap only' : 'other DEXs only';
     return { ok: false, symbol, category, reason: [category, ...reasons.slice(0, 1), top.join(', ')].filter(Boolean).join(' | ') };
   }
   if (best.minSide < opts.minLiqUsd) return { ok: false, symbol, reason: `thin side: $${Math.round(best.minSide)} < $${opts.minLiqUsd}` };
@@ -217,7 +230,8 @@ function analyse(token, pairs, opts) {
   const ageDays = Number.isFinite(oldest) ? (Date.now() - oldest) / 86400000 : null;
   if (opts.maxAgeDays > 0 && ageDays !== null && ageDays > opts.maxAgeDays) return { ok: false, symbol, reason: `token is ${Math.round(ageDays)}d old (max ${opts.maxAgeDays})` };
 
-  return { ok: true, token: getAddress(token), symbol, name, ...best, vol24, ageDays };
+  const { score, ...rest } = best;
+  return { ok: true, token: getAddress(token), symbol, name, ...rest, vol24, ageDays };
 }
 
 // ---------- 3. security check ----------
@@ -277,7 +291,7 @@ export async function discover({ log, opts }) {
   const skipStats = {};
   for (const x of skipped) skipStats[x.category ?? 'filtered'] = (skipStats[x.category ?? 'filtered'] ?? 0) + 1;
   // show the near-misses first: tokens on both DEXs, then single-DEX ones
-  const order = ['both DEXs but different/unsupported pairs', 'filtered', 'camelot only', 'uniswap only'];
+  const order = ['unsafe/unchecked', 'filtered', 'both DEXs but unsupported quote tokens', 'camelot only', 'uniswap only'];
   skipped.sort((a, b) => (order.indexOf(a.category) + 1 || 9) - (order.indexOf(b.category) + 1 || 9));
   return { list: list.slice(0, opts.maxTokens), skipped, skipStats, candidates: addresses.length };
 }

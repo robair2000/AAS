@@ -5,7 +5,7 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { JsonRpcProvider, formatUnits, parseUnits } from 'ethers';
-import { CHAIN_ID, TOKENS, STABLES, DEFAULT_PAIRS } from './config.js';
+import { CHAIN_ID, TOKENS, STABLES, QUOTE_TOKENS, DEFAULT_PAIRS } from './config.js';
 import { Batcher, buildQuoteCalls } from './quotes.js';
 import { discover } from './discovery.js';
 
@@ -31,12 +31,14 @@ const DISCOVERY_EVERY_MIN = num('DISCOVERY_EVERY_MIN', 10);
 const DISCOVERY = {
   maxCandidates: num('MAX_CANDIDATES', 90), // tokens pulled from trending feeds per round
   maxTokens: num('MAX_TOKENS', 25), // tokens actually scanned
-  minLiqUsd: num('MIN_LIQ_USD', 15000), // liquidity needed on BOTH the Camelot and Uniswap pool
+  minLiqUsd: num('MIN_LIQ_USD', 10000), // liquidity needed on BOTH the Camelot and Uniswap pool
   minVol24Usd: num('MIN_VOL24_USD', 10000),
   maxAgeDays: num('MAX_AGE_DAYS', 90), // 0 = no age limit
   maxTax: num('MAX_TAX', 0.005), // drop tokens with buy/sell tax above this (0.005 = 0.5%)
   requireSecurity: env('REQUIRE_SECURITY_CHECK', 'true') !== 'false',
+  crossQuote: env('CROSS_QUOTE', 'true') !== 'false', // allow e.g. WETH pool on Camelot vs USDC pool on Uniswap
 };
+const CONVERT_GAS_UNITS = BigInt(env('CONVERT_GAS_UNITS', 150000)); // extra swap when quotes differ
 const SIZE_PCTS = env('SIZE_PCTS', '0.5,2').split(',').map(Number); // % of the thinner pool's liquidity
 const MIN_TRADE_USD = num('MIN_TRADE_USD', 50);
 const MAX_TRADE_USD = num('MAX_TRADE_USD', 5000);
@@ -49,7 +51,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const provider = new JsonRpcProvider(RPC_URL, Number(CHAIN_ID), { staticNetwork: true });
 const batcher = new Batcher(provider, CHUNK_SIZE);
 const decCache = new Map(); // lowercase address -> decimals
-let watch = []; // [{ key, baseSym, base, baseDec, quoteSym, quote, quoteDec, sizes, v4Keys, url, info }]
+let watch = []; // [{ key, baseSym, base, camQuote, uniQuote, sizesUsd, v4Keys, url, info }]
 const stats = {};
 let csvPath = null;
 let running = true;
@@ -69,13 +71,29 @@ async function decimalsOf(addresses) {
 }
 const dec = (a) => decCache.get(a.toLowerCase());
 
-async function ethUsdAt(blockTag) {
-  const calls = buildQuoteCalls(TOKENS.WETH, TOKENS.USDC, parseUnits('1', 18)).filter((c) => c.dex === 'uniswap');
-  const q = await batcher.run(calls, blockTag);
-  const best = q.reduce((m, v) => (v !== null && v > m ? v : m), 0n);
-  if (best === 0n) throw new Error('Could not price ETH');
-  return Number(formatUnits(best, 6));
+// USD price of every quote token (stables = $1, others via Uniswap -> USDC)
+async function pricesAt(blockTag) {
+  const prices = {};
+  const groups = [];
+  const all = [];
+  for (const sym of QUOTE_TOKENS) {
+    if (STABLES.has(sym)) { prices[sym] = 1; continue; }
+    const calls = buildQuoteCalls(TOKENS[sym], TOKENS.USDC, parseUnits('1', dec(TOKENS[sym]))).filter((c) => c.dex === 'uniswap');
+    groups.push({ sym, start: all.length, n: calls.length });
+    all.push(...calls);
+  }
+  const q = await batcher.run(all, blockTag);
+  for (const g of groups) {
+    const best = q.slice(g.start, g.start + g.n).reduce((m, v) => (v !== null && v > m ? v : m), 0n);
+    if (best === 0n) throw new Error(`Could not price ${g.sym}`);
+    prices[g.sym] = Number(formatUnits(best, 6));
+  }
+  return prices;
 }
+const toUnits = (usd, sym, prices) => {
+  const d = dec(TOKENS[sym]);
+  return parseUnits((usd / prices[sym]).toFixed(Math.min(d, 8)), d);
+};
 
 // ---------- startup ----------
 async function init() {
@@ -88,14 +106,15 @@ async function init() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     csvPath = path.join(DATA_DIR, 'signals.csv');
     if (!fs.existsSync(csvPath))
-      fs.writeFileSync(csvPath, 'time,block,pair,token,size,quote,buy_on,sell_on,amount_in,amount_out,gross,gas_cost,net,net_usd,net_bps\n');
+      fs.writeFileSync(csvPath, 'time,block,pair,token,size_usd,start_token,buy_on,sell_on,route,amount_in,amount_back,gross_usd,gas_usd,net_usd,net_bps\n');
   }
 
   if (MODE === 'static') {
     const pairs = process.env.PAIRS_JSON ? JSON.parse(process.env.PAIRS_JSON) : DEFAULT_PAIRS;
+    const prices = await pricesAt('latest');
     watch = pairs.map((p) => {
-      if (!TOKENS[p.base] || !TOKENS[p.quote]) throw new Error(`Unknown token in pair ${p.base}/${p.quote}`);
-      return makeEntry({ baseSym: p.base, base: TOKENS[p.base], quoteSym: p.quote, sizes: p.sizes });
+      if (!TOKENS[p.base] || !QUOTE_TOKENS.includes(p.quote)) throw new Error(`Unsupported pair ${p.base}/${p.quote}`);
+      return makeEntry({ baseSym: p.base, base: TOKENS[p.base], camQuote: p.quote, uniQuote: p.quote, sizesUsd: p.sizes.map((x) => x * prices[p.quote]) });
     });
   } else {
     await refreshWatchlist();
@@ -103,13 +122,9 @@ async function init() {
   log({ msg: 'scanner started (read-only)', mode: MODE, rpc: RPC_URL.replace(/\/[^/]{12,}$/, '/***'), intervalMs: SCAN_INTERVAL_MS, minProfitUsd: MIN_PROFIT_USD, watching: watch.length });
 }
 
-function makeEntry({ baseSym, base, quoteSym, sizes, v4Keys = [], url = null, info = null }) {
-  return {
-    key: `${baseSym}(${base.slice(0, 6)})/${quoteSym}`,
-    baseSym, base, baseDec: dec(base),
-    quoteSym, quote: TOKENS[quoteSym], quoteDec: dec(TOKENS[quoteSym]),
-    sizes, v4Keys, url, info,
-  };
+function makeEntry({ baseSym, base, camQuote, uniQuote, sizesUsd, v4Keys = [], url = null, info = null }) {
+  const quotes = camQuote === uniQuote ? camQuote : `C:${camQuote} U:${uniQuote}`;
+  return { key: `${baseSym}(${base.slice(0, 6)})/${quotes}`, baseSym, base, camQuote, uniQuote, sizesUsd: sizesUsd.map((u) => round(u, 2)), v4Keys, url, info };
 }
 
 // Startup self-check: quote 1 WETH -> USDC on every venue and compare to Uniswap V3.
@@ -139,19 +154,15 @@ async function refreshWatchlist() {
     log({ msg: 'discovery failed, keeping previous watchlist', err: e.message });
     return;
   }
-  const ethUsd = await ethUsdAt('latest');
   await decimalsOf(found.list.map((t) => t.token));
 
   const next = [];
   for (const t of found.list) {
     if (dec(t.token) == null) continue;
-    const quoteUsd = t.quoteSym === 'WETH' ? ethUsd : 1;
     const sizesUsd = [...new Set(SIZE_PCTS.map((p) => Math.min(MAX_TRADE_USD, Math.max(MIN_TRADE_USD, (t.minSide * p) / 100))))];
-    const qDec = dec(TOKENS[t.quoteSym]);
-    const sizes = sizesUsd.map((u) => Number((u / quoteUsd).toFixed(Math.min(qDec, 8))));
     next.push(
       makeEntry({
-        baseSym: t.symbol ?? '?', base: t.token, quoteSym: t.quoteSym, sizes, v4Keys: t.v4Keys, url: t.url,
+        baseSym: t.symbol ?? '?', base: t.token, camQuote: t.camQuote, uniQuote: t.uniQuote, sizesUsd, v4Keys: t.v4Keys, url: t.url,
         info: { liqCamelot: Math.round(t.cam), liqUniswap: Math.round(t.uni), vol24: Math.round(t.vol24), ageDays: t.ageDays == null ? null : round(t.ageDays, 1), security: t.security, sources: t.sources },
       })
     );
@@ -167,7 +178,7 @@ async function refreshWatchlist() {
     msg: 'watchlist updated',
     tookSec: round((Date.now() - started) / 1000, 1),
     candidates: found.candidates,
-    watching: watch.map((w) => ({ pair: w.key, sizes: w.sizes, v4Pools: w.v4Keys.length, ...w.info })),
+    watching: watch.map((w) => ({ pair: w.key, sizesUsd: w.sizesUsd, v4Pools: w.v4Keys.length, ...w.info })),
     added: added.map((w) => w.key),
     removed,
     skipStats: found.skipStats,
@@ -178,87 +189,108 @@ async function refreshWatchlist() {
 }
 
 // ---------- one scan cycle ----------
+// Each watched token is tried in both directions:
+//   A) buy on Camelot with its quote token -> sell on Uniswap for Uniswap's quote token
+//   B) buy on Uniswap -> sell on Camelot
+// If the two quote tokens differ, a third leg converts the proceeds back to the
+// starting token (best venue on either DEX), so profit is always like-for-like.
+const bestOf = (calls, results, offset) => {
+  let best = null;
+  calls.forEach((c, i) => {
+    const v = results[offset + i];
+    if (v !== null && (!best || v > best.out)) best = { out: v, venue: c.venue };
+  });
+  return best;
+};
+
 async function scanOnce() {
   if (!watch.length) return {};
   const block = await provider.getBlockNumber();
   const fee = await provider.getFeeData();
   const gasPrice = fee.gasPrice ?? 10_000_000n;
-  const ethUsd = await ethUsdAt(block);
-  const gasUsd = Number(formatUnits(gasPrice * GAS_UNITS, 18)) * ethUsd + L1_FEE_USD;
+  const prices = await pricesAt(block);
+  const gasUsdFor = (convert) => Number(formatUnits(gasPrice * (GAS_UNITS + (convert ? CONVERT_GAS_UNITS : 0n)), 18)) * prices.WETH + L1_FEE_USD;
 
-  // Round 1: buy BASE with QUOTE on every venue
+  // Round 1: buy the token
   const jobs = [];
-  const round1 = [];
+  const r1Calls = [];
   for (const p of watch) {
-    for (const size of p.sizes) {
-      const amountIn = parseUnits(String(size), p.quoteDec);
-      const calls = buildQuoteCalls(p.quote, p.base, amountIn, p.v4Keys);
-      jobs.push({ p, size, amountIn, r1Start: round1.length, r1Calls: calls });
-      round1.push(...calls);
-    }
-  }
-  const r1 = await batcher.run(round1, block);
-
-  // Round 2: sell what DEX A gave us into DEX B (both directions)
-  const round2 = [];
-  for (const job of jobs) {
-    job.best = {};
-    job.r1Calls.forEach((c, i) => {
-      const v = r1[job.r1Start + i];
-      if (v !== null && (!job.best[c.dex] || v > job.best[c.dex].out)) job.best[c.dex] = { out: v, venue: c.venue };
-    });
-    job.legs = [];
-    for (const [buyDex, sellDex] of [['uniswap', 'camelot'], ['camelot', 'uniswap']]) {
-      const bought = job.best[buyDex];
-      if (!bought) continue;
-      const sellCalls = buildQuoteCalls(job.p.base, job.p.quote, bought.out, job.p.v4Keys).filter((c) => c.dex === sellDex);
-      job.legs.push({ buyDex, sellDex, bought, start: round2.length, calls: sellCalls });
-      round2.push(...sellCalls);
-    }
-  }
-  const r2 = await batcher.run(round2, block);
-
-  for (const job of jobs) {
-    const { p, size, amountIn } = job;
-    const st = (stats[p.key] ??= { cycles: 0, signals: 0, bestNetUsd: -Infinity, bestGrossBps: -Infinity, bestAt: null, url: p.url });
-    if (size === p.sizes[0]) st.cycles++;
-    const quoteUsd = p.quoteSym === 'WETH' ? ethUsd : 1;
-    const gasInQuote = gasUsd / quoteUsd;
-
-    for (const leg of job.legs) {
-      let best = null;
-      leg.calls.forEach((c, i) => {
-        const v = r2[leg.start + i];
-        if (v !== null && (!best || v > best.out)) best = { out: v, venue: c.venue };
-      });
-      if (!best) continue;
-
-      const inNum = Number(formatUnits(amountIn, p.quoteDec));
-      const outNum = Number(formatUnits(best.out, p.quoteDec));
-      const gross = outNum - inNum;
-      const net = gross - gasInQuote;
-      const netUsd = net * quoteUsd;
-      const grossBps = (gross / inNum) * 10000;
-      const netBps = (net / inNum) * 10000;
-
-      if (netUsd > st.bestNetUsd) { st.bestNetUsd = netUsd; st.bestAt = `$${Math.round(inNum * quoteUsd)} buy@${leg.buyDex}`; }
-      if (grossBps > st.bestGrossBps) st.bestGrossBps = grossBps;
-
-      if (netUsd >= MIN_PROFIT_USD) {
-        st.signals++;
-        const sig = {
-          msg: 'SIGNAL', block, pair: p.key, token: p.base, size, sizeUsd: round(inNum * quoteUsd, 0),
-          buyOn: `${leg.buyDex} (${leg.bought.venue})`, sellOn: `${leg.sellDex} (${best.venue})`,
-          in: round(inNum), out: round(outNum), grossBps: round(grossBps, 2), gasUsd: round(gasUsd, 4),
-          netUsd: round(netUsd, 2), netBps: round(netBps, 2), url: p.url,
-        };
-        log(sig);
-        writeCsv([new Date().toISOString(), block, p.key, p.base, size, p.quoteSym, sig.buyOn, sig.sellOn, inNum, outNum, gross, gasInQuote, net, netUsd, netBps]);
-        maybeAlert(`${p.key}|${leg.buyDex}`, sig);
+    for (const sizeUsd of p.sizesUsd) {
+      for (const [buyDex, sellDex] of [['camelot', 'uniswap'], ['uniswap', 'camelot']]) {
+        const inSym = buyDex === 'camelot' ? p.camQuote : p.uniQuote;
+        const outSym = sellDex === 'camelot' ? p.camQuote : p.uniQuote;
+        const amountIn = toUnits(sizeUsd, inSym, prices);
+        const calls = buildQuoteCalls(TOKENS[inSym], p.base, amountIn, p.v4Keys).filter((c) => c.dex === buyDex);
+        jobs.push({ p, sizeUsd, buyDex, sellDex, inSym, outSym, amountIn, c1: calls, o1: r1Calls.length });
+        r1Calls.push(...calls);
       }
     }
   }
-  return { block, ethUsd, gasUsd };
+  const r1 = await batcher.run(r1Calls, block);
+
+  // Round 2: sell it on the other DEX
+  const r2Calls = [];
+  for (const j of jobs) {
+    j.bought = bestOf(j.c1, r1, j.o1);
+    if (!j.bought) continue;
+    j.c2 = buildQuoteCalls(j.p.base, TOKENS[j.outSym], j.bought.out, j.p.v4Keys).filter((c) => c.dex === j.sellDex);
+    j.o2 = r2Calls.length;
+    r2Calls.push(...j.c2);
+  }
+  const r2 = await batcher.run(r2Calls, block);
+
+  // Round 3: convert back to the starting token if the quotes differ
+  const r3Calls = [];
+  for (const j of jobs) {
+    if (!j.bought) continue;
+    j.sold = bestOf(j.c2, r2, j.o2);
+    if (!j.sold || j.inSym === j.outSym) continue;
+    j.c3 = buildQuoteCalls(TOKENS[j.outSym], TOKENS[j.inSym], j.sold.out);
+    j.o3 = r3Calls.length;
+    r3Calls.push(...j.c3);
+  }
+  const r3 = r3Calls.length ? await batcher.run(r3Calls, block) : [];
+
+  for (const j of jobs) {
+    const { p } = j;
+    const st = (stats[p.key] ??= { checks: 0, signals: 0, bestNetUsd: -Infinity, bestGrossBps: -Infinity, bestAt: null, url: p.url });
+    if (!j.sold) continue;
+    const convert = j.inSym !== j.outSym;
+    const back = convert ? bestOf(j.c3, r3, j.o3) : { out: j.sold.out, venue: null };
+    if (!back) continue;
+    st.checks++;
+
+    const inDec = dec(TOKENS[j.inSym]);
+    const inNum = Number(formatUnits(j.amountIn, inDec));
+    const outNum = Number(formatUnits(back.out, inDec));
+    const px = prices[j.inSym];
+    const gasUsd = gasUsdFor(convert);
+    const grossUsd = (outNum - inNum) * px;
+    const netUsd = grossUsd - gasUsd;
+    const grossBps = ((outNum - inNum) / inNum) * 10000;
+    const netBps = (netUsd / (inNum * px)) * 10000;
+
+    if (netUsd > st.bestNetUsd) { st.bestNetUsd = netUsd; st.bestAt = `$${Math.round(j.sizeUsd)} buy@${j.buyDex}`; }
+    if (grossBps > st.bestGrossBps) st.bestGrossBps = grossBps;
+
+    if (netUsd >= MIN_PROFIT_USD) {
+      st.signals++;
+      const route = [
+        `buy ${p.baseSym} with ${j.inSym} on ${j.buyDex} (${j.bought.venue})`,
+        `sell for ${j.outSym} on ${j.sellDex} (${j.sold.venue})`,
+        ...(convert ? [`convert ${j.outSym}->${j.inSym} (${back.venue})`] : []),
+      ].join(' -> ');
+      const sig = {
+        msg: 'SIGNAL', block, pair: p.key, token: p.base, sizeUsd: round(j.sizeUsd, 0), route,
+        in: `${round(inNum)} ${j.inSym}`, out: `${round(outNum)} ${j.inSym}`,
+        grossBps: round(grossBps, 2), gasUsd: round(gasUsd, 4), netUsd: round(netUsd, 2), netBps: round(netBps, 2), url: p.url,
+      };
+      log(sig);
+      writeCsv([new Date().toISOString(), block, p.key, p.base, round(j.sizeUsd, 2), j.inSym, j.buyDex, j.sellDex, route, inNum, outNum, round(grossUsd, 4), round(gasUsd, 4), round(netUsd, 4), round(netBps, 2)]);
+      maybeAlert(`${p.key}|${j.buyDex}`, sig);
+    }
+  }
+  return { block, ethUsd: prices.WETH, gasUsd: gasUsdFor(false) };
 }
 
 // ---------- outputs ----------
@@ -286,14 +318,14 @@ function maybeAlert(key, s) {
   if (now - (lastAlert.get(key) ?? 0) < ALERT_COOLDOWN_MIN * 60000) return;
   lastAlert.set(key, now);
   notify(
-    `Arb signal ${s.pair} (block ${s.block})\nBuy on ${s.buyOn}, sell on ${s.sellOn}\n` +
+    `Arb signal ${s.pair} (block ${s.block})\n${s.route}\n` +
     `Size ~$${s.sizeUsd}: net ~$${s.netUsd} (${s.netBps} bps after gas)\n${s.url ?? ''}\nRead-only estimate. Real fills will be worse.`
   );
 }
 
 function summary(extra) {
   const rows = Object.entries(stats)
-    .map(([pair, s]) => ({ pair, cycles: s.cycles, signals: s.signals, bestGrossBps: round(s.bestGrossBps, 2), bestNetUsd: round(s.bestNetUsd, 2), bestAt: s.bestAt }))
+    .map(([pair, s]) => ({ pair, checks: s.checks, signals: s.signals, bestGrossBps: round(s.bestGrossBps, 2), bestNetUsd: round(s.bestNetUsd, 2), bestAt: s.bestAt }))
     .sort((a, b) => b.bestNetUsd - a.bestNetUsd);
   log({ msg: 'SUMMARY', ...extra, watching: watch.length, rpcRequests: batcher.rpcRequests, pairs: rows });
   if (rows.length && (DISCORD_WEBHOOK_URL || TELEGRAM_BOT_TOKEN)) {
