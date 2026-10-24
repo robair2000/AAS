@@ -10,9 +10,11 @@ import { JsonRpcProvider, formatUnits, parseUnits } from 'ethers';
 import { CHAIN_ID, TOKENS, STABLES, QUOTE_TOKENS } from './config.js';
 import { Batcher, buildQuoteCalls, dexCheckCalls, venueCall, venueName } from './quotes.js';
 import { discover } from './discovery.js';
+import { startEvents } from './events.js';
 
 // ---------- settings ----------
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
+const RPC_URL_RAW = () => env('RPC_URL', 'https://arb1.arbitrum.io/rpc');
 const num = (k, d) => Number(env(k, d));
 const RPC_URL = env('RPC_URL', 'https://arb1.arbitrum.io/rpc');
 const SCAN_INTERVAL_MS = num('SCAN_INTERVAL_MS', 15000);
@@ -21,6 +23,13 @@ const GAS_UNITS = BigInt(env('GAS_UNITS', 450000)); // two swaps + flash overhea
 const CONVERT_GAS_UNITS = BigInt(env('CONVERT_GAS_UNITS', 150000)); // extra swap when quote tokens differ
 const L1_FEE_USD = num('L1_FEE_USD', 0.02);
 const SUMMARY_EVERY_MIN = num('SUMMARY_EVERY_MIN', 60);
+// Live swap events: re-quote a token the moment one of its pools trades.
+// Needs a WebSocket RPC; by default derived from RPC_URL (https:// -> wss://).
+const EVENTS = env('EVENTS', 'true') !== 'false';
+const WSS_URL = env('WSS_URL', /alchemy|infura|quiknode|quicknode|ankr|blast|drpc/.test(RPC_URL_RAW()) ? RPC_URL_RAW().replace(/^https:/, 'wss:') : '');
+const EVENT_DEBOUNCE_MS = num('EVENT_DEBOUNCE_MS', 100); // gather swaps landing together into one re-quote
+const MARKET_CACHE_MS = num('MARKET_CACHE_MS', 15000); // how long quote-token prices / gas price are reused
+const BACKUP_SCAN_MS = num('BACKUP_SCAN_MS', 60000); // full scan interval while live events are connected
 const CHUNK_SIZE = num('MULTICALL_CHUNK', 40);
 const ALERT_COOLDOWN_MIN = num('ALERT_COOLDOWN_MIN', 10);
 const DATA_DIR = env('DATA_DIR', '');
@@ -56,6 +65,9 @@ const stats = {};
 let csvPath = null;
 let running = true;
 const lastAlert = new Map();
+let events = null; // live swap subscription (startEvents)
+const gaps = new Map(); // token key -> currently open profitable gap
+const eventStats = { swaps: 0, requotes: 0, requoteMsTotal: 0, gapsClosed: 0, gapSecs: [] };
 
 async function decimalsOf(addresses) {
   const missing = [...new Set(addresses.map((a) => a.toLowerCase()))].filter((a) => !decCache.has(a));
@@ -99,6 +111,14 @@ async function pricesAt(blockTag) {
   }
   return prices;
 }
+// prices + gas price, reused for MARKET_CACHE_MS so event re-quotes stay light
+let market = null;
+async function getMarket(block) {
+  if (market && Date.now() - market.at < MARKET_CACHE_MS) return market;
+  const [prices, fee] = await Promise.all([pricesAt(block), provider.getFeeData()]);
+  market = { at: Date.now(), prices, gasPrice: fee.gasPrice ?? 10_000_000n };
+  return market;
+}
 const toUnits = (usd, sym, prices) => {
   const d = dec(TOKENS[sym]);
   return parseUnits((usd / prices[sym]).toFixed(Math.min(d, 8)), d);
@@ -119,7 +139,7 @@ async function init() {
       fs.writeFileSync(csvPath, 'time,block,token,address,size_usd,start_token,buy_pool,sell_pool,route,amount_in,amount_back,gross_usd,gas_usd,net_usd,net_bps\n');
   }
   await refreshWatchlist();
-  log({ msg: 'scanner started (read-only)', rpc: RPC_URL.replace(/\/[^/]{12,}$/, '/***'), intervalMs: SCAN_INTERVAL_MS, minProfitUsd: MIN_PROFIT_USD, minLiqUsd: DISCOVERY.minLiqUsd, watching: watch.length });
+  log({ msg: 'scanner started (read-only)', rpc: RPC_URL.replace(/\/[^/]{12,}$/, '/***'), liveEvents: EVENTS && !!WSS_URL, intervalMs: SCAN_INTERVAL_MS, minProfitUsd: MIN_PROFIT_USD, minLiqUsd: DISCOVERY.minLiqUsd, watching: watch.length });
 }
 
 // Startup self-check: every DEX prices ETH (0.1 WETH -> USDC). A DEX that says
@@ -182,6 +202,7 @@ async function refreshWatchlist() {
     skipStats: found.skipStats,
     skippedSample: found.skipped.slice(0, 40).map(({ category, ...x }) => x),
   });
+  if (events && (added.length || removed.length)) events.refresh();
   if (added.length)
     notify(`Now watching ${added.length} token(s):\n` + added.map((w) => `${w.key}: ${w.venues.map((v) => v.name).join(', ')}\n${w.url ?? ''}`).join('\n'));
 }
@@ -194,18 +215,16 @@ async function refreshWatchlist() {
 //   3. if B and S use different quote tokens, quote converting S's proceeds
 //      back to B's quote token (best of Uniswap V3 / Camelot V3)
 //   profit = what comes back - what went in, minus gas
-async function scanOnce() {
-  if (!watch.length) return {};
-  const block = await provider.getBlockNumber();
-  const fee = await provider.getFeeData();
-  const gasPrice = fee.gasPrice ?? 10_000_000n;
-  const prices = await pricesAt(block);
+async function scanTokens(tokens, { blockTag = null, trigger = 'timer', eventAt = null } = {}) {
+  if (!tokens.length) return {};
+  const block = blockTag ?? (await provider.getBlockNumber());
+  const { prices, gasPrice } = await getMarket(block);
   const gasUsdFor = (convert) => Number(formatUnits(gasPrice * (GAS_UNITS + (convert ? CONVERT_GAS_UNITS : 0n)), 18)) * prices.WETH + L1_FEE_USD;
 
   // Round 1: buy on every pool
   const jobs = [];
   const r1Calls = [];
-  for (const p of watch) {
+  for (const p of tokens) {
     for (const sizeUsd of p.sizesUsd) {
       const buys = [];
       for (const v of p.venues) {
@@ -257,6 +276,7 @@ async function scanOnce() {
   }
   const r3 = r3Calls.length ? await batcher.run(r3Calls, block) : [];
 
+  const bestByToken = new Map(); // token key -> best profitable result this pass
   for (const j of jobs) {
     const { p } = j;
     const st = (stats[p.key] ??= { checks: 0, signals: 0, bestNetUsd: -Infinity, bestGrossBps: -Infinity, bestAt: null, url: p.url });
@@ -280,25 +300,91 @@ async function scanOnce() {
 
     if (netUsd > st.bestNetUsd) { st.bestNetUsd = netUsd; st.bestAt = `$${Math.round(j.sizeUsd)}: ${pair}`; }
     if (grossBps > st.bestGrossBps) st.bestGrossBps = grossBps;
+    if (netUsd < MIN_PROFIT_USD) continue;
 
-    if (netUsd >= MIN_PROFIT_USD) {
-      st.signals++;
-      const route = [
-        `buy ${p.baseSym} with ${inSym} on ${j.B.v.name}`,
-        `sell for ${j.S.v.quoteSym} on ${j.S.v.name}`,
-        ...(convert ? [`convert ${j.S.v.quoteSym}->${inSym} (${back.venue})`] : []),
-      ].join(' -> ');
-      const sig = {
-        msg: 'SIGNAL', block, token: p.key, address: p.base, sizeUsd: round(j.sizeUsd, 0), route,
+    st.signals++;
+    const route = [
+      `buy ${p.baseSym} with ${inSym} on ${j.B.v.name}`,
+      `sell for ${j.S.v.quoteSym} on ${j.S.v.name}`,
+      ...(convert ? [`convert ${j.S.v.quoteSym}->${inSym} (${back.venue})`] : []),
+    ].join(' -> ');
+    writeCsv([new Date().toISOString(), block, p.key, p.base, round(j.sizeUsd, 2), inSym, j.B.v.name, j.S.v.name, route, inNum, outNum, round(grossUsd, 4), round(gasUsd, 4), round(netUsd, 4), round(netBps, 2)]);
+    const cur = bestByToken.get(p.key);
+    if (!cur || netUsd > cur.netUsd) {
+      bestByToken.set(p.key, {
+        msg: 'SIGNAL', block, trigger, token: p.key, address: p.base, sizeUsd: round(j.sizeUsd, 0), route,
         in: `${round(inNum)} ${inSym}`, out: `${round(outNum)} ${inSym}`,
-        grossBps: round(grossBps, 2), gasUsd: round(gasUsd, 4), netUsd: round(netUsd, 2), netBps: round(netBps, 2), url: p.url,
-      };
-      log(sig);
-      writeCsv([new Date().toISOString(), block, p.key, p.base, round(j.sizeUsd, 2), inSym, j.B.v.name, j.S.v.name, route, inNum, outNum, round(grossUsd, 4), round(gasUsd, 4), round(netUsd, 4), round(netBps, 2)]);
-      maybeAlert(`${p.key}|${pair}`, sig);
+        grossBps: round(grossBps, 2), gasUsd: round(gasUsd, 4), netUsd: round(netUsd, 2), netBps: round(netBps, 2),
+        ...(eventAt ? { msSinceSwapSeen: Date.now() - eventAt } : {}), url: p.url,
+      });
     }
   }
+  for (const p of tokens) trackGap(p, bestByToken.get(p.key) ?? null, block);
   return { block, ethUsd: prices.WETH, gasUsd: gasUsdFor(false) };
+}
+const scanOnce = () => scanTokens(watch);
+
+// A gap "opens" the first time a token has a profitable route and "closes" when
+// a later quote no longer finds one. How long gaps stay open is the key number
+// for deciding whether an execution bot could realistically catch them.
+const lastEvalBlock = new Map(); // token key -> newest block evaluated
+function trackGap(p, sig, block) {
+  if (block < (lastEvalBlock.get(p.key) ?? 0)) return; // stale result from an older block
+  lastEvalBlock.set(p.key, block);
+  const g = gaps.get(p.key);
+  if (sig) {
+    if (!g) {
+      gaps.set(p.key, { openedAt: Date.now(), openedBlock: block, maxNet: sig.netUsd, route: sig.route });
+      log(sig); // one SIGNAL line per gap, not per re-quote
+      maybeAlert(p.key, sig);
+    } else if (sig.netUsd > g.maxNet) {
+      g.maxNet = sig.netUsd;
+      g.route = sig.route;
+    }
+  } else if (g) {
+    const secs = (Date.now() - g.openedAt) / 1000;
+    gaps.delete(p.key);
+    eventStats.gapsClosed++;
+    eventStats.gapSecs.push(secs);
+    log({ msg: 'GAP CLOSED', token: p.key, openSec: round(secs, 1), openBlocks: block - g.openedBlock, maxNetUsd: round(g.maxNet, 2), route: g.route });
+  }
+}
+
+// ---------- live swap events ----------
+const dirty = new Map(); // token key -> { block, at }
+let requoting = false;
+function onSwap(key, block) {
+  eventStats.swaps++;
+  const d = dirty.get(key);
+  dirty.set(key, { block: Math.max(block, d?.block ?? 0), at: d?.at ?? Date.now() });
+  drainDirty();
+}
+async function drainDirty() {
+  if (requoting) return;
+  requoting = true;
+  try {
+    while (dirty.size) {
+      await sleep(EVENT_DEBOUNCE_MS);
+      const batch = [...dirty.entries()];
+      dirty.clear();
+      const keys = new Set(batch.map(([k]) => k));
+      const tokens = watch.filter((w) => keys.has(w.key));
+      if (!tokens.length) continue;
+      const block = Math.max(...batch.map(([, d]) => d.block));
+      const eventAt = Math.min(...batch.map(([, d]) => d.at));
+      const t0 = Date.now();
+      try {
+        await scanTokens(tokens, { blockTag: block, trigger: 'swap', eventAt });
+      } catch (e) {
+        // the HTTP node may not have served the event's block yet: retry on latest
+        await scanTokens(tokens, { trigger: 'swap', eventAt }).catch((e2) => log({ msg: 'swap re-quote failed', err: e2.shortMessage ?? e2.message }));
+      }
+      eventStats.requotes++;
+      eventStats.requoteMsTotal += Date.now() - t0;
+    }
+  } finally {
+    requoting = false;
+  }
 }
 
 // ---------- outputs ----------
@@ -335,10 +421,22 @@ function summary(extra) {
   const rows = Object.entries(stats)
     .map(([token, s]) => ({ token, checks: s.checks, signals: s.signals, bestGrossBps: round(s.bestGrossBps, 2), bestNetUsd: round(s.bestNetUsd, 2), bestAt: s.bestAt }))
     .sort((a, b) => b.bestNetUsd - a.bestNetUsd);
-  log({ msg: 'SUMMARY', ...extra, watching: watch.length, rpcRequests: batcher.rpcRequests, tokens: rows });
+  const secs = [...eventStats.gapSecs].sort((a, b) => a - b);
+  const live = {
+    connected: events?.stats.connected ?? false,
+    swapsSeen: eventStats.swaps,
+    requotes: eventStats.requotes,
+    avgRequoteMs: eventStats.requotes ? Math.round(eventStats.requoteMsTotal / eventStats.requotes) : null,
+    gapsClosed: eventStats.gapsClosed,
+    medianGapSec: secs.length ? round(secs[Math.floor(secs.length / 2)], 1) : null,
+    gapsOpenNow: gaps.size,
+  };
+  log({ msg: 'SUMMARY', ...extra, watching: watch.length, rpcRequests: batcher.rpcRequests, live, tokens: rows });
+  Object.assign(eventStats, { swaps: 0, requotes: 0, requoteMsTotal: 0, gapsClosed: 0, gapSecs: [] });
   if (rows.length && (DISCORD_WEBHOOK_URL || TELEGRAM_BOT_TOKEN)) {
     const lines = rows.slice(0, 15).map((r) => `${r.token}: ${r.signals} signals, best net $${r.bestNetUsd} (gross ${r.bestGrossBps} bps, ${r.bestAt})`).join('\n');
-    notify(`Scanner summary (last ${SUMMARY_EVERY_MIN} min, top ${Math.min(15, rows.length)})\n${lines}`);
+    const liveLine = `Live: ${live.swapsSeen} swaps seen, ${live.requotes} re-quotes (avg ${live.avgRequoteMs ?? '-'} ms), ${live.gapsClosed} gaps closed (median ${live.medianGapSec ?? '-'} s)`;
+    notify(`Scanner summary (last ${SUMMARY_EVERY_MIN} min, top ${Math.min(15, rows.length)})\n${liveLine}\n${lines}`);
   }
   for (const k of Object.keys(stats)) delete stats[k];
 }
@@ -346,6 +444,11 @@ function summary(extra) {
 // ---------- main loop ----------
 async function main() {
   await init();
+  if (EVENTS && WSS_URL && typeof WebSocket === 'function') {
+    events = startEvents({ wsUrl: WSS_URL, log, getWatch: () => watch, onSwap });
+  } else {
+    log({ msg: 'live swap events off', reason: !EVENTS ? 'EVENTS=false' : !WSS_URL ? 'no WebSocket URL (set WSS_URL)' : 'WebSocket not available in this Node version' });
+  }
   let lastSummary = Date.now();
   let lastDiscovery = Date.now();
   let discovering = false;
@@ -377,7 +480,9 @@ async function main() {
       summary({ ethUsd: round(lastInfo.ethUsd ?? 0, 2), gasUsdPerTx: round(lastInfo.gasUsd ?? 0, 4) });
       lastSummary = Date.now();
     }
-    const wait = failures ? SCAN_INTERVAL_MS * Math.min(failures, 6) : Math.max(0, SCAN_INTERVAL_MS - (Date.now() - started));
+    // with live events connected, the full scan is only a safety net, so it runs less often
+    const interval = events?.stats.connected ? Math.max(SCAN_INTERVAL_MS, BACKUP_SCAN_MS) : SCAN_INTERVAL_MS;
+    const wait = failures ? interval * Math.min(failures, 6) : Math.max(0, interval - (Date.now() - started));
     await sleep(wait);
   }
 }
@@ -386,6 +491,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
     log({ msg: `${sig} received, shutting down` });
     running = false;
+    events?.stop();
     summary({ reason: 'shutdown' });
     setTimeout(() => process.exit(0), 1500);
   });

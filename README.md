@@ -23,11 +23,17 @@ It **never signs or sends a transaction** and needs no private key.
 5. GoPlus security check: drops honeypots, tax above `MAX_TAX`, owner-controlled balances, modifiable tax, pausable transfers, unverified contracts.
 6. Trade sizes: 0.5 % and 2 % of the 2nd-deepest pool (clamped to $50–$5,000).
 
-**Scanning (every 15 s)** — for each token and size, at one pinned block:
+**Live swap events (default on)**
+The scanner keeps a WebSocket open to your RPC (Alchemy: `RPC_URL` with `https://` swapped for `wss://`, done automatically) and subscribes to every watched pool's swap events: Uniswap/SushiSwap/Camelot V3 `Swap`, PancakeSwap V3 `Swap`, V2 `Sync`, and Uniswap V4 `Swap` on the PoolManager. When a pool trades, only that token is re-quoted, at the block of the swap (typically within ~100–300 ms). The full scan below keeps running every 60 s as a safety net, or every 15 s if the socket is down. The socket pings every 30 s and reconnects with backoff if it drops.
+
+**Gap tracking**
+A gap *opens* the first time a token has a route netting ≥ `MIN_PROFIT_USD` (one `SIGNAL` line + alert) and *closes* when a later quote no longer finds one (`GAP CLOSED` with how many seconds and blocks it stayed open). The hourly `SUMMARY` has a `live` block: swaps seen, re-quotes, average re-quote time, gaps closed and the median gap lifetime. Gap lifetime is the number that tells you whether an execution bot could realistically get there first.
+
+**Full scan** — for each token and size, at one pinned block:
 1. Quote buying the token on every pool; take the pool giving the most tokens.
 2. Quote selling that amount on every *other* pool; take the one returning the most USD.
 3. If the two pools use different quote tokens, quote converting back (best of Uniswap V3 / Camelot V3), with extra gas counted.
-4. Log a `SIGNAL` when net profit ≥ `MIN_PROFIT_USD`; log a `SUMMARY` every hour.
+4. Feed the result into gap tracking (above).
 
 ## Deploy on Render (background worker)
 
@@ -37,7 +43,8 @@ It **never signs or sends a transaction** and needs no private key.
 4. In **Logs**, in order:
    - `venue check` — each DEX prices 0.1 WETH → USDC. `ok` means its quoter works. `no quote` means its pools are ignored.
    - `watchlist updated` — tokens picked, with each pool and its liquidity, plus `skipStats` and a sample of skipped tokens with reasons.
-   - `SIGNAL` lines and an hourly `SUMMARY`.
+   - `swap events subscribed` — how many pools the live connection is watching.
+   - `SIGNAL` (gap opened), `GAP CLOSED` (with lifetime) and an hourly `SUMMARY`.
 
 Notes: background workers have no free tier on Render (Starter is enough). Logs are kept for a limited time; use Discord/Telegram, or a persistent disk + `DATA_DIR=/var/data` for `signals.csv`.
 
