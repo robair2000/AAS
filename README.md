@@ -1,62 +1,64 @@
-# Arbitrum arb scanner — new & trending tokens (Camelot ↔ Uniswap), read-only
+# Arbitrum multi-DEX arb scanner — read-only
 
-Finds **new, trending Arbitrum tokens** that trade on both **Camelot** and **Uniswap**, then watches them for round trips that would be profitable after fees, price impact and gas:
+Finds trending Arbitrum tokens that trade in **two or more pools** across:
 
-> buy TOKEN with WETH/USDC on DEX A → sell it back on DEX B
+| DEX | Pool types |
+|---|---|
+| Uniswap | v2, v3 (all fee tiers), v4 (hookless pools) |
+| PancakeSwap | v3 |
+| SushiSwap | v2, v3 |
+| Camelot | v2, v3 |
 
-It **never signs or sends a transaction** and needs no private key. The goal is to measure how often real gaps appear on young tokens before you spend money on an execution bot.
+…then watches them for "buy in one pool, sell in another" round trips that would be profitable after pool fees, price impact and gas. Two pools on the **same** DEX count too (e.g. Uniswap 0.3 % vs 1 %, or Uniswap v3 vs v4).
+
+It **never signs or sends a transaction** and needs no private key.
 
 ## How it works
 
-**Discovery (every 10 min)**
-1. Pulls candidates from free feeds: GeckoTerminal trending + newest Arbitrum pools, DexScreener boosted tokens and new token profiles.
-2. Drops established tokens (WETH, stables, ARB, GMX, LINK, UNI, wstETH…; see `EXCLUDE_TOKENS` in `src/config.js`).
-3. Asks DexScreener for every pool of each candidate and keeps tokens that have a pool on **both** Camelot and Uniswap, paired against WETH, USDC, USDC.e, USDT, WBTC or ARB, with at least `MIN_LIQ_USD` on each side, enough 24h volume, and a first pool younger than `MAX_AGE_DAYS`. The two DEXs may use **different** quote tokens (e.g. TOKEN/WETH on Camelot, TOKEN/USDC on Uniswap); the same quote is preferred when liquidity is similar.
-4. Runs a **GoPlus security check** and drops honeypots, tokens with tax above `MAX_TAX`, owner-controlled balances, modifiable tax, pausable transfers, or unverified contracts.
-5. Sizes trades from liquidity: 0.5 % and 2 % of the thinner pool (clamped to $50–$5,000).
+**Discovery (every 15 min)**
+1. Candidates from GeckoTerminal trending + newest Arbitrum pools, DexScreener boosted tokens and new profiles, plus any addresses in `WATCH_TOKENS`.
+2. Drops established tokens (WETH, stables, ARB, GMX, LINK, UNI, wstETH…; see `src/config.js`).
+3. Pulls every pool of each candidate from DexScreener. Keeps pools on the DEXs above, paired with WETH, USDC, USDC.e, USDT, WBTC or ARB, with at least `MIN_LIQ_USD`. Uniswap/PancakeSwap/SushiSwap pools are classified as v2 or v3 on-chain (by reading the pool's fee).
+4. A token needs **2+ usable pools**, enough 24h volume, and a first pool younger than `MAX_AGE_DAYS`.
+5. GoPlus security check: drops honeypots, tax above `MAX_TAX`, owner-controlled balances, modifiable tax, pausable transfers, unverified contracts.
+6. Trade sizes: 0.5 % and 2 % of the 2nd-deepest pool (clamped to $50–$5,000).
 
-**Scanning (every 15 s)**
-1. Pins one block so every quote is consistent.
-2. Quotes the buy on every venue — Uniswap V3 (all fee tiers), Uniswap V4 (hookless pools), Camelot V3 and Camelot V2 — through Multicall3, keeping the best per DEX.
-3. Quotes selling the exact amount bought into the *other* DEX.
-4. If the quote tokens differ, quotes converting the proceeds back to the starting token on the best venue (an extra swap, with extra gas counted).
-5. Subtracts estimated gas and logs a `SIGNAL` when net profit ≥ `MIN_PROFIT_USD`.
-6. Logs a `SUMMARY` every hour, ranked by best gap.
+**Scanning (every 15 s)** — for each token and size, at one pinned block:
+1. Quote buying the token on every pool; take the pool giving the most tokens.
+2. Quote selling that amount on every *other* pool; take the one returning the most USD.
+3. If the two pools use different quote tokens, quote converting back (best of Uniswap V3 / Camelot V3), with extra gas counted.
+4. Log a `SIGNAL` when net profit ≥ `MIN_PROFIT_USD`; log a `SUMMARY` every hour.
 
 ## Deploy on Render (background worker)
 
-1. Push this folder to a GitHub repo.
-2. In Render: **New → Blueprint**, pick the repo (it reads `render.yaml`), or **New → Background Worker** with build `npm install` and start `npm start`.
+1. Push this folder to GitHub with `render.yaml`, `package.json` and `README.md` at the **top level** and the `.js` files inside `src/`.
+2. Render: **New → Blueprint** (reads `render.yaml`), or **New → Background Worker** with build `npm install`, start `npm start`.
 3. Set `RPC_URL` (and optional Discord/Telegram vars) in the Environment tab.
-4. Watch the **Logs** tab. In order you should see:
-   - `venue check` — quotes 1 WETH → USDC on every venue; each should say `ok`. A Camelot venue saying `no quote` or `WARNING` means its quotes aren't being read correctly.
-   - `watchlist updated` — the tokens it picked, their liquidity on each DEX, and a sample of skipped tokens with the reason.
+4. In **Logs**, in order:
+   - `venue check` — each DEX prices 0.1 WETH → USDC. `ok` means its quoter works. `no quote` means its pools are ignored.
+   - `watchlist updated` — tokens picked, with each pool and its liquidity, plus `skipStats` and a sample of skipped tokens with reasons.
    - `SIGNAL` lines and an hourly `SUMMARY`.
 
-Notes:
-- Background workers have **no free tier** on Render; Starter is enough.
-- Render's disk is wiped on every deploy/restart and logs are kept for a limited time. Use Discord/Telegram for alerts and summaries, or add a persistent disk and set `DATA_DIR=/var/data` to keep `signals.csv`.
-- The worker exits after 20 consecutive RPC errors so Render restarts it.
+Notes: background workers have no free tier on Render (Starter is enough). Logs are kept for a limited time; use Discord/Telegram, or a persistent disk + `DATA_DIR=/var/data` for `signals.csv`.
 
 ## Tuning
 
 | Want | Change |
 |---|---|
-| Younger tokens only | `MAX_AGE_DAYS=14` |
-| More tokens (more risk) | lower `MIN_LIQ_USD`, `MIN_VOL24_USD` |
-| Same quote token on both DEXs only | `CROSS_QUOTE=false` |
-| Fewer RPC requests | raise `SCAN_INTERVAL_MS`, lower `MAX_TOKENS` |
-| Bigger/smaller test trades | `SIZE_PCTS`, `MAX_TRADE_USD` |
-| Old fixed list of big pairs | `MODE=static` |
+| Newer tokens only | `MAX_AGE_DAYS=14` |
+| More tokens (more noise) | lower `MIN_LIQ_USD`, `MIN_VOL24_USD` |
+| Always watch a token | `WATCH_TOKENS=0xabc…,0xdef…` |
+| Fewer RPC requests | raise `SCAN_INTERVAL_MS`, lower `MAX_TOKENS` / `MAX_POOLS_PER_TOKEN` |
+| Fewer GeckoTerminal 429s | raise `DISCOVERY_EVERY_MIN` |
 
-RPC load: 25 tokens × 2 sizes is roughly 700 quotes ≈ 20 RPC requests per cycle. At 15 s that's ~115k requests/day, more than most free RPC plans allow. Use 30–60 s or a paid plan.
+RPC load is roughly tokens × sizes × pools × 2 quotes per cycle. 25 tokens × 2 sizes × 4 pools ≈ 400 quotes ≈ 12 requests per cycle.
 
-## What it can't see (yet)
+## What it can't see
 
-- **Uniswap V4 pools with hooks or unusual fees.** Many new launches use these; they're listed under `skippedSample` in the watchlist log.
-- **Camelot's newest pool version** (Algebra Integral). Tokens only listed there are skipped.
-- **Transfer taxes in the quotes themselves.** The DEX quoters ignore token taxes, which is why taxed tokens are filtered by the security check. A token can change its tax later.
+- Uniswap v4 pools with hooks or unusual fees, and Camelot's newest pool version.
+- PancakeSwap v2 pools, and v3 pools with non-standard fee tiers.
+- Token transfer taxes in the quotes themselves (taxed tokens are filtered by the security check instead).
 
-## Reading signals on young tokens
+## Reading signals
 
-Signals are **upper bounds**. On new tokens a big gap is often there for a reason: the pool is about to be pulled, the token has hidden sell restrictions the security check missed, or liquidity is so thin the gap disappears with any real trade. Check the token on DexScreener (the link is in each alert) before trusting anything.
+Signals are **upper bounds**. A real bot sees them later than this scanner and competes with faster searchers. On young tokens a big gap often means trouble: liquidity about to be pulled, hidden sell restrictions, or a pool too thin to fill. Check the DexScreener link in each alert.
