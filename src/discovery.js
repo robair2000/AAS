@@ -224,30 +224,54 @@ async function buildVenues(addresses, byToken, batcher, opts) {
 }
 
 // ---------- 3. security check ----------
-async function securityCheck(addresses, opts) {
+async function securityCheck(addresses, opts, log) {
   const out = {};
-  for (let i = 0; i < addresses.length; i += 20) {
-    const chunk = addresses.slice(i, i + 20);
-    try {
-      const j = await getJson(`${GOPLUS}?contract_addresses=${chunk.join(',')}`);
-      for (const [addr, r] of Object.entries(j?.result ?? {})) {
-        const flags = [];
-        const yes = (k) => r[k] === '1';
-        const tax = Math.max(Number(r.buy_tax || 0), Number(r.sell_tax || 0));
-        if (yes('is_honeypot')) flags.push('honeypot');
-        if (tax > opts.maxTax) flags.push(`tax ${(tax * 100).toFixed(1)}%`);
-        if (yes('cannot_sell_all')) flags.push('cannot sell all');
-        if (yes('owner_change_balance')) flags.push('owner can change balances');
-        if (yes('slippage_modifiable')) flags.push('tax modifiable');
-        if (yes('transfer_pausable')) flags.push('transfers pausable');
-        if (r.is_open_source === '0') flags.push('contract not verified');
-        out[addr.toLowerCase()] = flags;
-      }
-    } catch {
-      // missing -> caller decides (strict mode drops unchecked tokens)
+  const parse = (j) => {
+    for (const [addr, r] of Object.entries(j?.result ?? {})) {
+      if (!r || !Object.keys(r).length) continue; // empty entry = not analyzed yet
+      const flags = [];
+      const yes = (k) => r[k] === '1';
+      const tax = Math.max(Number(r.buy_tax || 0), Number(r.sell_tax || 0));
+      if (yes('is_honeypot')) flags.push('honeypot');
+      if (tax > opts.maxTax) flags.push(`tax ${(tax * 100).toFixed(1)}%`);
+      if (yes('cannot_sell_all')) flags.push('cannot sell all');
+      if (yes('owner_change_balance')) flags.push('owner can change balances');
+      if (yes('slippage_modifiable')) flags.push('tax modifiable');
+      if (yes('transfer_pausable')) flags.push('transfers pausable');
+      if (r.is_open_source === '0') flags.push('contract not verified');
+      out[addr.toLowerCase()] = flags;
     }
-    await sleep(1000);
+  };
+  const replies = [];
+  // first pass in batches of 20
+  for (let i = 0; i < addresses.length; i += 20) {
+    try {
+      const j = await getJson(`${GOPLUS}?contract_addresses=${addresses.slice(i, i + 20).join(',')}`);
+      parse(j);
+      if (j?.code !== 1) replies.push({ code: j?.code, message: j?.message });
+    } catch (e) {
+      replies.push({ error: e.message });
+    }
+    await sleep(1500);
   }
+  // GoPlus often has no data the first time it sees a token, or answers a
+  // batch partially; retry the missing ones one by one after a pause
+  const missing = addresses.filter((a) => !out[a]);
+  if (missing.length) {
+    await sleep(5000);
+    for (const a of missing) {
+      try {
+        const j = await getJson(`${GOPLUS}?contract_addresses=${a}`);
+        parse(j);
+        if (!out[a]) replies.push({ token: a.slice(0, 10), code: j?.code, message: j?.message });
+      } catch (e) {
+        replies.push({ token: a.slice(0, 10), error: e.message });
+      }
+      await sleep(2500);
+    }
+  }
+  const stillMissing = addresses.filter((a) => !out[a]).length;
+  if (stillMissing) log({ msg: 'security check incomplete', missing: stillMissing, of: addresses.length, goplusReplies: replies.slice(0, 5) });
   return out;
 }
 
@@ -286,7 +310,7 @@ export async function discover({ log, opts, batcher }) {
     });
   }
 
-  const sec = await securityCheck(ok.map((t) => t.token.toLowerCase()), opts);
+  const sec = await securityCheck(ok.map((t) => t.token.toLowerCase()), opts, log);
   const list = [];
   for (const t of ok) {
     const flags = sec[t.token.toLowerCase()];
