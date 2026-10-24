@@ -1,0 +1,31 @@
+services:
+  - type: worker
+    name: arb-scanner
+    runtime: node
+    region: frankfurt # set at creation; Render can't move an existing service
+    plan: starter # background workers have no free tier on Render
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: RPC_URL
+        sync: false # paste your Alchemy / Infura / QuickNode Arbitrum URL in the dashboard
+      - key: MODE
+        value: trending
+      - key: SCAN_INTERVAL_MS
+        value: "15000"
+      - key: MIN_PROFIT_USD
+        value: "1"
+      - key: MIN_LIQ_USD
+        value: "10000"
+      - key: MAX_AGE_DAYS
+        value: "90"
+      - key: SUMMARY_EVERY_MIN
+        value: "60"
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

@@ -11,7 +11,7 @@ It **never signs or sends a transaction** and needs no private key. The goal is 
 **Discovery (every 10 min)**
 1. Pulls candidates from free feeds: GeckoTerminal trending + newest Arbitrum pools, DexScreener boosted tokens and new token profiles.
 2. Drops established tokens (WETH, stables, ARB, GMX, LINK, UNI, wstETH…; see `EXCLUDE_TOKENS` in `src/config.js`).
-3. Asks DexScreener for every pool of each candidate and keeps tokens that have a pool on **both** Camelot and Uniswap against the **same** quote token (WETH, USDC, USDC.e or USDT), with at least `MIN_LIQ_USD` on each side, enough 24h volume, and a first pool younger than `MAX_AGE_DAYS`.
+3. Asks DexScreener for every pool of each candidate and keeps tokens that have a pool on **both** Camelot and Uniswap, paired against WETH, USDC, USDC.e, USDT, WBTC or ARB, with at least `MIN_LIQ_USD` on each side, enough 24h volume, and a first pool younger than `MAX_AGE_DAYS`. The two DEXs may use **different** quote tokens (e.g. TOKEN/WETH on Camelot, TOKEN/USDC on Uniswap); the same quote is preferred when liquidity is similar.
 4. Runs a **GoPlus security check** and drops honeypots, tokens with tax above `MAX_TAX`, owner-controlled balances, modifiable tax, pausable transfers, or unverified contracts.
 5. Sizes trades from liquidity: 0.5 % and 2 % of the thinner pool (clamped to $50–$5,000).
 
@@ -19,8 +19,9 @@ It **never signs or sends a transaction** and needs no private key. The goal is 
 1. Pins one block so every quote is consistent.
 2. Quotes the buy on every venue — Uniswap V3 (all fee tiers), Uniswap V4 (hookless pools), Camelot V3 and Camelot V2 — through Multicall3, keeping the best per DEX.
 3. Quotes selling the exact amount bought into the *other* DEX.
-4. Subtracts estimated gas and logs a `SIGNAL` when net profit ≥ `MIN_PROFIT_USD`.
-5. Logs a `SUMMARY` every hour, ranked by best gap.
+4. If the quote tokens differ, quotes converting the proceeds back to the starting token on the best venue (an extra swap, with extra gas counted).
+5. Subtracts estimated gas and logs a `SIGNAL` when net profit ≥ `MIN_PROFIT_USD`.
+6. Logs a `SUMMARY` every hour, ranked by best gap.
 
 ## Deploy on Render (background worker)
 
@@ -43,6 +44,7 @@ Notes:
 |---|---|
 | Younger tokens only | `MAX_AGE_DAYS=14` |
 | More tokens (more risk) | lower `MIN_LIQ_USD`, `MIN_VOL24_USD` |
+| Same quote token on both DEXs only | `CROSS_QUOTE=false` |
 | Fewer RPC requests | raise `SCAN_INTERVAL_MS`, lower `MAX_TOKENS` |
 | Bigger/smaller test trades | `SIZE_PCTS`, `MAX_TRADE_USD` |
 | Old fixed list of big pairs | `MODE=static` |
