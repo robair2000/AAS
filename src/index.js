@@ -114,16 +114,17 @@ function makeEntry({ baseSym, base, quoteSym, sizes, v4Keys = [], url = null, in
 
 // Startup self-check: quote 1 WETH -> USDC on every venue and compare to Uniswap V3.
 async function venueCheck() {
-  const calls = buildQuoteCalls(TOKENS.WETH, TOKENS.USDC, parseUnits('1', 18));
+  // 0.1 WETH keeps price impact small, so a thin pool doesn't look like a broken quoter
+  const calls = buildQuoteCalls(TOKENS.WETH, TOKENS.USDC, parseUnits('0.1', 18));
   const res = await batcher.run(calls, 'latest');
-  const prices = calls.map((c, i) => ({ venue: c.venue, usd: res[i] === null ? null : Number(formatUnits(res[i], 6)) }));
+  const prices = calls.map((c, i) => ({ venue: c.venue, usd: res[i] === null ? null : Number(formatUnits(res[i], 6)) * 10 }));
   const ref = Math.max(...prices.filter((p) => p.venue.startsWith('uni') && p.usd).map((p) => p.usd));
   if (!Number.isFinite(ref) || ref <= 0) throw new Error('Uniswap quoter returned nothing for WETH/USDC. Check RPC_URL.');
   for (const p of prices) {
-    p.status = p.usd === null ? 'no quote (pool missing or call failed)' : Math.abs(p.usd / ref - 1) > 0.05 ? 'WARNING: >5% off Uniswap' : 'ok';
+    p.status = p.usd === null ? 'no quote (pool missing or call failed)' : Math.abs(p.usd / ref - 1) > 0.05 ? 'far off Uniswap (thin pool for WETH/USDC, or quoter problem)' : 'ok';
     if (p.usd !== null) p.usd = round(p.usd, 2);
   }
-  log({ msg: 'venue check: 1 WETH -> USDC', venues: prices });
+  log({ msg: 'venue check: ETH price per venue (quoted with 0.1 WETH -> USDC)', venues: prices });
   if (!prices.some((p) => p.venue.startsWith('camelot') && p.status === 'ok'))
     log({ msg: 'WARNING: no Camelot venue returned a sane quote; Camelot results will be missing' });
 }
@@ -169,7 +170,8 @@ async function refreshWatchlist() {
     watching: watch.map((w) => ({ pair: w.key, sizes: w.sizes, v4Pools: w.v4Keys.length, ...w.info })),
     added: added.map((w) => w.key),
     removed,
-    skippedSample: found.skipped.slice(0, 25),
+    skipStats: found.skipStats,
+    skippedSample: found.skipped.slice(0, 40).map(({ address, category, ...x }) => x),
   });
   if (added.length)
     notify(`Now watching ${added.length} new token(s):\n` + added.map((w) => `${w.key}  liq C $${w.info.liqCamelot} / U $${w.info.liqUniswap}  ${w.url ?? ''}`).join('\n'));
@@ -306,14 +308,19 @@ async function main() {
   await init();
   let lastSummary = Date.now();
   let lastDiscovery = Date.now();
+  let discovering = false;
   let lastInfo = {};
   let failures = 0;
 
   while (running) {
     const started = Date.now();
-    if (MODE !== 'static' && Date.now() - lastDiscovery >= DISCOVERY_EVERY_MIN * 60000) {
-      await refreshWatchlist().catch((e) => log({ msg: 'watchlist refresh error', err: e.message }));
+    // Discovery takes ~1 min (API rate limits), so it runs alongside scanning
+    if (MODE !== 'static' && !discovering && Date.now() - lastDiscovery >= DISCOVERY_EVERY_MIN * 60000) {
+      discovering = true;
       lastDiscovery = Date.now();
+      refreshWatchlist()
+        .catch((e) => log({ msg: 'watchlist refresh error', err: e.message }))
+        .finally(() => (discovering = false));
     }
     try {
       lastInfo = await scanOnce();

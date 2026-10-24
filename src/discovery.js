@@ -2,7 +2,7 @@
 // runs a security check on them, and returns a watchlist for the scanner.
 //
 // Sources (all free, no API key):
-//   - GeckoTerminal: trending pools + newest pools on Arbitrum
+//   - GeckoTerminal: trending pools, newest pools and busiest Camelot pools on Arbitrum
 //   - DexScreener:  latest boosted tokens + latest token profiles (filtered to Arbitrum)
 //   - DexScreener:  all pairs for each candidate (to confirm Camelot + Uniswap listings)
 //   - GoPlus:       honeypot / tax / owner-power checks
@@ -47,13 +47,33 @@ async function getJson(url, { timeoutMs = 15000, tries = 3 } = {}) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isAddr = (a) => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a);
 
+const GT_SPACING_MS = 6500;
+let camelotIdsCache = null;
+async function camelotDexIds(log) {
+  if (camelotIdsCache) return camelotIdsCache;
+  const ids = [];
+  try {
+    for (const page of [1, 2]) {
+      const j = await getJson(`${GT}/networks/arbitrum/dexes?page=${page}`);
+      for (const d of j.data ?? []) if (String(d.id).toLowerCase().includes('camelot')) ids.push(d.id);
+      await sleep(GT_SPACING_MS);
+      if (!(j.data ?? []).length) break;
+    }
+  } catch (e) {
+    log({ msg: 'could not list GeckoTerminal dexes', err: e.message });
+  }
+  if (ids.length) camelotIdsCache = ids.slice(0, 3);
+  log({ msg: 'camelot dex ids on GeckoTerminal', ids });
+  return ids.slice(0, 3);
+}
+
 // ---------- 1. candidate tokens from trending feeds ----------
 async function candidateTokens(log) {
   const found = new Map(); // address -> { sources:Set, rank }
   const add = (addr, source, rank) => {
     if (!isAddr(addr)) return;
     const a = addr.toLowerCase();
-    if (EXCLUDED.has(a) || QUOTES[a]) return;
+    if (EXCLUDED.has(a) || QUOTES[a] || a === ZeroAddress) return;
     const cur = found.get(a) ?? { sources: new Set(), rank: Infinity };
     cur.sources.add(source);
     cur.rank = Math.min(cur.rank, rank);
@@ -61,11 +81,8 @@ async function candidateTokens(log) {
   };
   const gtTokenAddr = (rel) => rel?.data?.id?.split('_')[1];
 
-  const feeds = [
-    ['gecko-trending', `${GT}/networks/arbitrum/trending_pools?page=1`],
-    ['gecko-new', `${GT}/networks/arbitrum/new_pools?page=1`],
-  ];
-  for (const [name, url] of feeds) {
+  // GeckoTerminal keyless limit is ~10 calls/min, so calls are spaced out.
+  const gt = async (name, url) => {
     try {
       const j = await getJson(url);
       (j.data ?? []).forEach((p, i) => {
@@ -75,7 +92,13 @@ async function candidateTokens(log) {
     } catch (e) {
       log({ msg: 'discovery feed failed', feed: name, err: e.message });
     }
-    await sleep(1500); // GeckoTerminal keyless limit is low
+    await sleep(GT_SPACING_MS);
+  };
+  for (const page of [1, 2]) await gt('gecko-trending', `${GT}/networks/arbitrum/trending_pools?page=${page}`);
+  for (const page of [1, 2]) await gt('gecko-new', `${GT}/networks/arbitrum/new_pools?page=${page}`);
+  // Busiest Camelot pools: Camelot listing is the rarer half of "on both DEXs"
+  for (const dexId of await camelotDexIds(log)) {
+    await gt('gecko-camelot', `${GT}/networks/arbitrum/dexes/${dexId}/pools?page=1&sort=h24_volume_usd_desc`);
   }
 
   for (const [name, path] of [
@@ -95,15 +118,25 @@ async function candidateTokens(log) {
 }
 
 // ---------- 2. which candidates trade on both DEXs ----------
-async function pairsFor(addresses) {
-  const all = [];
-  for (let i = 0; i < addresses.length; i += 30) {
-    const chunk = addresses.slice(i, i + 30);
-    const j = await getJson(`${DS}/tokens/v1/arbitrum/${chunk.join(',')}`);
-    if (Array.isArray(j)) all.push(...j);
-    else if (Array.isArray(j?.pairs)) all.push(...j.pairs);
-  }
-  return all;
+async function pairsFor(addresses, log) {
+  const byToken = Object.fromEntries(addresses.map((a) => [a, []]));
+  let failed = 0;
+  const queue = [...addresses];
+  const worker = async () => {
+    while (queue.length) {
+      const a = queue.shift();
+      try {
+        const j = await getJson(`${DS}/token-pairs/v1/arbitrum/${a}`);
+        byToken[a] = Array.isArray(j) ? j : Array.isArray(j?.pairs) ? j.pairs : [];
+      } catch {
+        failed++;
+      }
+      await sleep(250); // stays well under DexScreener's 300 req/min
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  if (failed) log({ msg: 'token-pairs lookups failed', failed, of: addresses.length });
+  return byToken;
 }
 
 function poolIdV4(c0, c1, fee, ts, hooks = ZeroAddress) {
@@ -129,6 +162,7 @@ function analyse(token, pairs, opts) {
   const byQuote = {}; // quoteSym -> { camelot:[], uniswap:[], v4Keys:[] }
   let symbol = null, name = null, oldest = Infinity, vol24 = 0;
 
+  const seen = []; // every pool, for the skip reason
   for (const p of pairs) {
     const base = p.baseToken?.address?.toLowerCase();
     const quote = p.quoteToken?.address?.toLowerCase();
@@ -136,6 +170,8 @@ function analyse(token, pairs, opts) {
     if (base === t) { other = quote; symbol ??= p.baseToken.symbol; name ??= p.baseToken.name; }
     else if (quote === t) { other = base; symbol ??= p.quoteToken.symbol; name ??= p.quoteToken.name; }
     else continue;
+    const otherSym = base === t ? p.quoteToken?.symbol : p.baseToken?.symbol;
+    seen.push({ where: `${p.dexId}${(p.labels ?? []).length ? ' ' + p.labels.join('/') : ''} vs ${otherSym}`, liq: Number(p.liquidity?.usd ?? 0) });
 
     // DexScreener may show native-ETH v4 pools with the zero address
     const quoteSym = QUOTES[other] ?? (other === ZeroAddress.toLowerCase() ? 'WETH' : null);
@@ -169,7 +205,13 @@ function analyse(token, pairs, opts) {
     const minSide = Math.min(cam, uni);
     if (minSide > (best?.minSide ?? 0)) best = { quoteSym, cam, uni, minSide, v4Keys: e.v4Keys, url: (e.uniswap[0] ?? e.camelot[0])?.url };
   }
-  if (!best) return { ok: false, symbol, reason: reasons[0] ?? 'not on both Camelot and Uniswap with WETH/stable' };
+  if (!best) {
+    const top = seen.sort((a, b) => b.liq - a.liq).slice(0, 3).map((x) => `${x.where} $${Math.round(x.liq)}`);
+    const onCam = seen.some((x) => x.where.startsWith('camelot'));
+    const onUni = seen.some((x) => x.where.startsWith('uniswap'));
+    const category = !seen.length ? 'no pools found' : onCam && onUni ? 'both DEXs but different/unsupported pairs' : onCam ? 'camelot only' : onUni ? 'uniswap only' : 'other DEXs only';
+    return { ok: false, symbol, category, reason: [category, ...reasons.slice(0, 1), top.join(', ')].filter(Boolean).join(' | ') };
+  }
   if (best.minSide < opts.minLiqUsd) return { ok: false, symbol, reason: `thin side: $${Math.round(best.minSide)} < $${opts.minLiqUsd}` };
   if (vol24 < opts.minVol24Usd) return { ok: false, symbol, reason: `24h volume $${Math.round(vol24)} too low` };
   const ageDays = Number.isFinite(oldest) ? (Date.now() - oldest) / 86400000 : null;
@@ -213,31 +255,29 @@ export async function discover({ log, opts }) {
   const addresses = ranked.slice(0, opts.maxCandidates).map(([a]) => a);
   if (!addresses.length) return { list: [], skipped: [], candidates: 0 };
 
-  const pairs = await pairsFor(addresses);
-  const byToken = Object.fromEntries(addresses.map((a) => [a, []]));
-  for (const p of pairs) {
-    for (const side of [p.baseToken?.address, p.quoteToken?.address]) {
-      const a = side?.toLowerCase();
-      if (a && byToken[a]) byToken[a].push(p);
-    }
-  }
+  const byToken = await pairsFor(addresses, log);
 
   const ok = [];
   const skipped = [];
   for (const a of addresses) {
     const r = analyse(a, byToken[a], opts);
     if (r.ok) ok.push({ ...r, sources: [...cands.get(a).sources] });
-    else skipped.push({ token: r.symbol ?? a.slice(0, 10), reason: r.reason });
+    else skipped.push({ token: r.symbol ?? a.slice(0, 10), address: a, category: r.category ?? 'filtered', reason: r.reason });
   }
 
   const sec = await securityCheck(ok.map((t) => t.token.toLowerCase()), opts);
   const list = [];
   for (const t of ok) {
     const flags = sec[t.token.toLowerCase()];
-    if (flags === undefined && opts.requireSecurity) { skipped.push({ token: t.symbol, reason: 'security check unavailable' }); continue; }
-    if (flags?.length) { skipped.push({ token: t.symbol, reason: `unsafe: ${flags.join(', ')}` }); continue; }
+    if (flags === undefined && opts.requireSecurity) { skipped.push({ token: t.symbol, category: 'unsafe/unchecked', reason: 'security check unavailable' }); continue; }
+    if (flags?.length) { skipped.push({ token: t.symbol, category: 'unsafe/unchecked', reason: `unsafe: ${flags.join(', ')}` }); continue; }
     list.push({ ...t, security: flags === undefined ? 'unchecked' : 'passed' });
   }
   list.sort((a, b) => b.vol24 - a.vol24);
-  return { list: list.slice(0, opts.maxTokens), skipped, candidates: addresses.length };
+  const skipStats = {};
+  for (const x of skipped) skipStats[x.category ?? 'filtered'] = (skipStats[x.category ?? 'filtered'] ?? 0) + 1;
+  // show the near-misses first: tokens on both DEXs, then single-DEX ones
+  const order = ['both DEXs but different/unsupported pairs', 'filtered', 'camelot only', 'uniswap only'];
+  skipped.sort((a, b) => (order.indexOf(a.category) + 1 || 9) - (order.indexOf(b.category) + 1 || 9));
+  return { list: list.slice(0, opts.maxTokens), skipped, skipStats, candidates: addresses.length };
 }
